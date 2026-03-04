@@ -120,7 +120,7 @@ jobs:
       - name: Build image for Trivy
         run: docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@0.34
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           format: sarif
@@ -130,7 +130,7 @@ jobs:
           vuln-type: os,library
           scanners: vuln,secret  # Also scan for secrets in image layers
       - name: Upload Trivy results
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: trivy-results.sarif
