@@ -57,12 +57,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: python
           queries: security-extended
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: "/language:python"
 
@@ -76,7 +76,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Run pip-audit
-        uses: pypa/gh-action-pip-audit@v2
+        uses: pypa/gh-action-pip-audit@v1.1.0
         with:
           require-hashes: false
           # pip-audit exits 1 on any vulnerability — pipeline fails per policy
