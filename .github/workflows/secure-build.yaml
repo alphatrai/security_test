@@ -120,7 +120,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build image for Trivy
-        run: docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+        run: |
+          docker buildx build \
+            --builder default \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --load \
+            -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
       - name: Manual Trivy Setup
         uses: aquasecurity/setup-trivy@v0.2.0
         with:
@@ -151,7 +157,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build image for Syft
-        run: docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+        run: |
+          docker buildx build \
+            --builder default \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --load \
+            -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
       - name: Install Syft
         run: |
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
@@ -178,7 +190,12 @@ jobs:
       - name: Build and get image ID
         id: build
         run: |
-          docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          docker buildx build \
+            --builder default \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --load \
+            -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
           # Image ID (config digest); RepoDigests populated only after push to registry
           image_id=$(docker inspect --format='{{.Id}}' ${{ env.IMAGE_NAME }}:${{ github.sha }})
           echo "digest=$image_id" >> $GITHUB_OUTPUT
