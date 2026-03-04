@@ -1,0 +1,237 @@
+# Secure Build Pipeline — InfoSec Deployment Compliance
+# Aligns with praxis_rcb_deployment_info_sec_review.md controls:
+# - SAST, SCA, secret scanning; pipeline fails on critical/high
+# - SBOM generation per release
+# - Release manifest (tag → digest → build ID)
+# - No secrets in image; non-root container (Dockerfile)
+#
+# Setup for ECR push:
+#   Repository variables: ECR_REGISTRY, (optional) ECR_REPOSITORY, AWS_REGION
+#   Repository secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   GitHub orgs: add GITLEAKS_LICENSE to secrets for gitleaks-action
+name: Secure Build Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:  # On-demand manual trigger
+
+# Concurrency: cancel in-progress runs for the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege permissions per security hardening
+permissions:
+  contents: read
+  security-events: write  # For CodeQL upload
+  actions: read
+  id-token: write  # For OIDC with AWS (optional; use if not using static keys)
+
+env:
+  IMAGE_NAME: solution  # Override via repository variable if needed
+
+jobs:
+  # --- Secret scanning: prevent credentials in code ---
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for leak detection
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}  # Required for GitHub orgs
+
+  # --- SAST: static analysis for security flaws ---
+  sast:
+    name: SAST (CodeQL)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-extended
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+
+  # --- SCA: dependency vulnerability scanning ---
+  sca-deps:
+    name: SCA (Dependencies)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run pip-audit
+        uses: pypa/gh-action-pip-audit@v2
+        with:
+          require-hashes: false
+          # pip-audit exits 1 on any vulnerability — pipeline fails per policy
+
+  # --- Build Docker image ---
+  build:
+    name: Build Image
+    runs-on: ubuntu-latest
+    needs: [secret-scan, sast, sca-deps]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=raw,value=build-${{ github.run_id }}
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # --- SCA (Image): container vulnerability scan — fail on CRITICAL/HIGH ---
+  sca-image:
+    name: SCA (Container Image)
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image for Trivy
+        run: docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.34
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          vuln-type: os,library
+          scanners: vuln,secret  # Also scan for secrets in image layers
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  # --- SBOM: generate per release ---
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image for Syft
+        run: docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+      - name: Generate SBOM
+        run: |
+          syft ${{ env.IMAGE_NAME }}:${{ github.sha }} -o spdx-json=sbom.spdx.json
+          syft ${{ env.IMAGE_NAME }}:${{ github.sha }} -o cyclonedx-json=sbom.cyclonedx.json
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.run_id }}
+          path: |
+            sbom.spdx.json
+            sbom.cyclonedx.json
+
+  # --- Release manifest: tag → digest → build ID ---
+  release-manifest:
+    name: Release Manifest
+    runs-on: ubuntu-latest
+    needs: [build, sca-image, sbom]
+    if: success()
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and get image ID
+        id: build
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          # Image ID (config digest); RepoDigests populated only after push to registry
+          image_id=$(docker inspect --format='{{.Id}}' ${{ env.IMAGE_NAME }}:${{ github.sha }})
+          echo "digest=$image_id" >> $GITHUB_OUTPUT
+          echo "digest_short=$image_id" >> $GITHUB_OUTPUT
+      - name: Create release manifest
+        run: |
+          digest="${{ steps.build.outputs.digest_short }}"
+          cat > release-manifest-${{ github.run_id }}.json << EOF
+          {
+            "build_id": "${{ github.run_id }}",
+            "workflow": "${{ github.workflow }}",
+            "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "sha": "${{ github.sha }}",
+            "ref": "${{ github.ref }}",
+            "triggered_by": "${{ github.event_name }}",
+            "image_tag": "${{ github.sha }}",
+            "image_digest": "${digest}",
+            "timestamp_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          cat release-manifest-${{ github.run_id }}.json
+      - name: Upload release manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest-${{ github.run_id }}
+          path: release-manifest-${{ github.run_id }}.json
+
+  # --- Push to ECR (only when AWS credentials configured) ---
+  push-ecr:
+    name: Push to ECR
+    runs-on: ubuntu-latest
+    needs: [build, sca-image, sbom]
+    # Runs when ECR_REGISTRY is configured; requires AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY in repo secrets
+    if: success() && vars.ECR_REGISTRY != ''
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
+      ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'solution' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push
+        id: build-push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:build-${{ github.run_id }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Output image digest
+        run: |
+          echo "Image pushed. Digest available in build-push step outputs."
+          echo "Tag: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
